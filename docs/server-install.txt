@@ -1,0 +1,80 @@
+奶蛙 Nailong — 服务器版皮肤模组（OS:RP / open.mp / SA-MP 0.3.DL）
+====================================================================
+
+一、包内容
+---------
+models/nailong.dff      模型（566 KB，32 根标准 ped 骨骼，已蒙皮）
+models/nailong.txd      贴图（4 MB，1024x1024，纹理名 nailong）
+artconfig_add.txt       需要加进 artconfig.txt 的注册行
+安装说明.txt            本文件
+
+
+二、安装（3 步，约 1 分钟）
+-------------------------
+1. 放模型
+   把 models 里的 nailong.dff、nailong.txd 复制到服务端 models 目录：
+       open.mp     →  <服务端根>/models/
+       SA-MP 0.3.DL→  <服务端根>/models/
+
+2. 注册皮肤
+   打开 <服务端根>/models/artconfig.txt，在任意一条 AddCharModel 之后另起一行加入：
+       AddCharModel(280, 20362, "nailong.dff", "nailong.txd");
+   （artconfig_add.txt 里就是这一行，直接复制粘贴即可）
+
+   注意：artconfig.txt 必须是 LF 换行、不要带 BOM，否则部分客户端读不到。
+
+3. 重启服务端
+   重启后注册生效。脚本里调用：
+       SetPlayerSkin(playerid, 20362);
+   或游戏内（如果有皮肤指令）：
+       /setskin 20362
+
+
+三、注册行参数说明（改 ID 就改这三个数字/名字）
+------------------------------------------------
+AddCharModel(基础皮肤ID, 新皮肤ID, "模型文件名", "贴图文件名");
+
+  基础皮肤ID：决定动画骨架和动作。奶蛙用的是 280（洛圣都警察，男性站姿）。
+             换成 0 就是 CJ 的骨架，走路/持枪动作会不一样。
+  新皮肤ID  ：必须是 20000 以上、且没有被其他 AddCharModel 占用（0.3.DL 的
+             自定义皮肤上限为 19999 个，常用区间 20000–29999）。
+             本包默认 20362，如果撞号就改成 20363、20364……
+  模型文件名：不带路径，与 models 里的文件名完全一致（区分大小写）。
+  贴图文件名：dff 和 txd 必须同名配对（这里都是 nailong）。
+
+
+四、想要多个 ID / 不同骨架（可选）
+----------------------------------
+同一套模型可以注册多次，得到多个 ID（不同动画骨架）：
+    AddCharModel(280, 20362, "nailong.dff", "nailong.txd");   // 警察骨架
+    AddCharModel(0,   20363, "nailong.dff", "nailong.txd");   // CJ 骨架
+    AddCharModel(1,   20364, "nailong.dff", "nailong.txd");   // Truth 骨架
+
+如果只想换一个 ID，把 20362 改成你想要的其他未占用 ID 即可，
+模型和贴图文件名不用动（除非你另外改了文件名）。
+
+
+五、客户端
+---------
+open.mp / SA-MP 0.3.DL 客户端进服时会自动从 artwork 端口下载 models。
+请确认：
+  - config.json 里 artwork.enable = true，models_path = "models"
+  - artwork 端口（默认 7777/TCP）在防火墙/安全组已放通
+否则玩家会卡在 "Updating models"。
+
+
+六、常见问题
+-----------
+1) 服务器日志出现 Cannot add custom model. nailong.dff doesn't exist
+   → 文件没放进 models，或 artconfig 里文件名大小写/路径与实际不一致。
+
+2) 玩家能进服但皮肤不显示（还是原皮）
+   → 服务端没重启；或 SetPlayerSkin 用的 ID 不是注册的 20362；
+     或 artconfig 换行是 CRLF / 带了 BOM。
+
+3) 模型发黑、发暗
+   → 本包已移除顶点色（不会出现这个问题）。若你自行改过模型，注意不要
+     保留全黑的顶点色层。
+
+4) ID 撞号（后注册的皮肤无效）
+   → 用 / 换一个没被占用的 ID，并确认服务端日志没有重复 ID 报错。
