@@ -476,7 +476,7 @@ def build_arm(side):
     knots = [0.0]
     for l in seg_len:
         knots.append(knots[-1] + l / total)
-    BOW, T0, T1 = 0.19, 0.12, 0.70
+    BOW, T0, T1 = 0.135, 0.20, 0.62
     sgn = 1.0 if pt[0].z > 0 else -1.0
 
     def bow_at(t):
