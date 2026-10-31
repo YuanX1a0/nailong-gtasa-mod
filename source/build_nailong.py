@@ -82,6 +82,7 @@ bpy.data.objects.remove(base_mesh, do_unlink=True)
 import bmesh
 
 TARGET_TRIS = 9000
+BODY_TRIS_CARVED = 7200
 DETAIL_TRIS = 1800
 
 def keep_mats(me, keep):
@@ -166,7 +167,182 @@ bpy.ops.object.modifier_apply(modifier=dmod.name)
 log("DECIMATED_DETAIL", "tris_before", dtris, "verts", len(det.data.vertices),
     "polys", len(det.data.polygons))
 
-# ---- skin the body while it is still one clean shell (heat weighting works best) ----
+# NOTE: the body is skinned only after the flippers have been carved away and
+# the shell re-sealed — voxel remesh throws vertex groups away, so skinning any
+# earlier would be destroyed by the clean-up pass (see 4.5c).
+
+# ============================================================
+# 4.5 cut the welded flipper off the flanks and hang real arms
+#     the source model melts its arms into the belly, so any arm bone
+#     motion used to drag the whole flank out into a wing. carving the
+#     welded mass away leaves a shallow socket, and the slim limb added
+#     on top is weighted only to the arm chain, so posing the arms can
+#     never deform the torso again.
+# ============================================================
+byname = {b.name.strip().lower(): b for b in arm.data.bones}
+
+def bone_named(side, part):
+    pre = ('l' if side == 'L' else 'r') + part
+    for n, b in byname.items():
+        if n.replace(' ', '').startswith(pre):
+            return b
+    raise KeyError(pre)
+
+ARM_PARTS = ('upperarm', 'forearm', 'hand')
+CHAIN = {}                             # side -> [shoulder, elbow, wrist, fingertip]
+SEGS = []                              # (head, tail, bone name, side, seg index)
+for side in ('L', 'R'):
+    pts = [arm.matrix_world @ bone_named(side, p).head_local
+           for p in ('upperarm', 'forearm', 'hand', 'finger')]
+    CHAIN[side] = pts
+    log("ARM_CHAIN", side, [[round(c, 3) for c in p] for p in pts])
+    for i, part in enumerate(ARM_PARTS):
+        SEGS.append((pts[i], pts[i + 1], bone_named(side, part).name, side, i))
+
+def seg_dist(p, h, t):
+    ab = t - h
+    l2 = ab.length_squared
+    u = 0.0 if l2 == 0 else max(0.0, min(1.0, (p - h).dot(ab) / l2))
+    return (p - (h + ab * u)).length
+
+# ---- 4.5a carve the welded arm mass off the body ----
+# Deleting the faces inside a capsule and stitching the rim by hand leaves thin
+# zig-zag sheets welded to the flank that survive every remesh pass. A boolean
+# difference against a solid capsule volume instead yields a watertight manifold
+# shell with one clean socket wall.
+CARVE_PR = (0.185, 0.205, 0.230, 0.310)   # shoulder, elbow, wrist, fingertip
+cparts = []
+for side in ('L', 'R'):
+    pt = CHAIN[side]
+    for i in range(4):
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=16,
+                                             radius=CARVE_PR[i], location=pt[i])
+        cparts.append(bpy.context.object)
+    for i in range(3):
+        h, t = pt[i], pt[i + 1]
+        dv = t - h
+        bpy.ops.mesh.primitive_cone_add(vertices=24, radius1=CARVE_PR[i],
+                                        radius2=CARVE_PR[i + 1], depth=dv.length,
+                                        location=(h + t) * 0.5)
+        c = bpy.context.object
+        c.rotation_mode = 'QUATERNION'
+        c.rotation_quaternion = dv.to_track_quat('Z', 'Y')
+        cparts.append(c)
+bpy.ops.object.select_all(action='DESELECT')
+for o in cparts:
+    o.select_set(True)
+bpy.context.view_layer.objects.active = cparts[0]
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+bpy.ops.object.join()
+cutter = bpy.context.object
+cutter.name = "arm_cutter"
+crm = cutter.modifiers.new("crm", 'REMESH')
+crm.mode = 'VOXEL'
+crm.voxel_size = 0.012
+bpy.ops.object.modifier_apply(modifier=crm.name)
+log("CUTTER", "verts", len(cutter.data.vertices), "polys", len(cutter.data.polygons))
+
+boo = nail.modifiers.new("carve", 'BOOLEAN')
+boo.operation = 'DIFFERENCE'
+boo.solver = 'EXACT'
+boo.object = cutter
+bpy.ops.object.select_all(action='DESELECT')
+nail.select_set(True)
+bpy.context.view_layer.objects.active = nail
+bpy.ops.object.modifier_apply(modifier=boo.name)
+bpy.data.objects.remove(cutter, do_unlink=True)
+nail_me.update()
+log("CARVED", "verts", len(nail_me.vertices), "polys", len(nail_me.polygons))
+
+bpy.ops.object.select_all(action='DESELECT')
+nail.select_set(True)
+bpy.context.view_layer.objects.active = nail
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.mesh.vertices_smooth(factor=0.4, repeat=2)
+bpy.ops.object.mode_set(mode='OBJECT')
+nail_me.update()
+log("CARVE_SEALED", "verts", len(nail_me.vertices), "polys", len(nail_me.polygons))
+
+# ---- 4.5b keep only the main shell, then voxel-remesh the crater rim flat ----
+# the cut leaves a ragged rim plus, at the far tip of the old flipper, a paper
+# thin fin that no distance test can catch. dropping every stray island and
+# re-meshing the shell melts those leftovers into a smooth socket.
+bm = bmesh.new()
+bm.from_mesh(nail_me)
+bm.faces.ensure_lookup_table()
+seen = set()
+islands = []
+for f in bm.faces:
+    if f.index in seen:
+        continue
+    stack, comp = [f], []
+    seen.add(f.index)
+    while stack:
+        cur = stack.pop()
+        comp.append(cur)
+        for e in cur.edges:
+            for nf in e.link_faces:
+                if nf.index not in seen:
+                    seen.add(nf.index)
+                    stack.append(nf)
+    islands.append(comp)
+islands.sort(key=len, reverse=True)
+junk = [f for comp in islands[1:] for f in comp]
+if junk:
+    bmesh.ops.delete(bm, geom=junk, context='FACES')
+    loose = [v for v in bm.verts if not v.link_faces]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='VERTS')
+bm.to_mesh(nail_me)
+bm.free()
+nail_me.update()
+log("BODY_ISLANDS", "before", len(islands), "dropped_faces", len(junk),
+    "verts", len(nail_me.vertices))
+
+bm = bmesh.new()
+bm.from_mesh(nail_me)
+open_e = sum(1 for e in bm.edges if len(e.link_faces) < 2)
+nonman_e = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+vol = bm.calc_volume(signed=True)
+bm.free()
+log("BODY_TOPOLOGY", "open_edges", open_e, "nonmanifold_edges", nonman_e,
+    "signed_volume", round(vol, 4))
+
+# side profile of the shell above the waist, so the shoulder cutter can be
+# sized from measured geometry instead of guesswork
+for i in range(6, 19):
+    lo = i * 0.05
+    vs = [v.co for v in nail_me.vertices if lo <= v.co.x < lo + 0.05]
+    if vs:
+        log("PROFILE", round(lo, 2), "n", len(vs),
+            "maxZ", round(max(abs(v.z) for v in vs), 3),
+            "maxY", round(max(abs(v.y) for v in vs), 3))
+
+bpy.ops.object.select_all(action='DESELECT')
+nail.select_set(True)
+bpy.context.view_layer.objects.active = nail
+rm2 = nail.modifiers.new("rm2", 'REMESH')
+rm2.mode = 'VOXEL'
+rm2.voxel_size = 0.010
+rm2.use_smooth_shade = True
+bpy.ops.object.modifier_apply(modifier=rm2.name)
+t3 = sum(len(p.vertices) - 2 for p in nail.data.polygons)
+log("RESEAL_RAW", "verts", len(nail.data.vertices), "polys", len(nail.data.polygons),
+    "tris", t3)
+dc3 = nail.modifiers.new("dec3", 'DECIMATE')
+dc3.decimate_type = 'COLLAPSE'
+dc3.ratio = min(1.0, BODY_TRIS_CARVED / t3)
+dc3.use_collapse_triangulate = True
+bpy.ops.object.modifier_apply(modifier=dc3.name)
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.mesh.vertices_smooth(factor=0.4, repeat=2)
+bpy.ops.object.mode_set(mode='OBJECT')
+nail_me.update()
+log("BODY_RESEALED", "verts", len(nail_me.vertices), "polys", len(nail_me.polygons))
+
+# ---- 4.5c skin the sealed shell (heat weighting needs the final topology) ----
 bpy.ops.object.select_all(action='DESELECT')
 nail.select_set(True)
 arm.select_set(True)
@@ -199,13 +375,46 @@ if body_zero == len(nail.data.vertices):
     log("FALLBACK_WEIGHTS", "zero",
         sum(1 for v in nail.data.vertices if not v.groups))
 
-# ---- eyes + mouth are rigid on the head bone ----
+# ---- 4.5d body keeps torso bones only ----
+ARM_KEY = ('upperarm', 'forearm', 'hand', 'finger')
+arm_gidx = set(g.index for g in nail.vertex_groups
+               if any(k in g.name.strip().lower() for k in ARM_KEY))
+arm_bone_names = set(g.name for g in nail.vertex_groups if g.index in arm_gidx)
+torso_bones = [(arm.matrix_world @ b.head_local, arm.matrix_world @ b.tail_local, b.name)
+               for b in arm.data.bones if b.name not in arm_bone_names]
+
+def set_weights(ob, v, pairs):
+    for gi in [g.group for g in v.groups]:
+        ob.vertex_groups[gi].remove([v.index])
+    for name, w in pairs:
+        if w <= 1e-5:
+            continue
+        vg = ob.vertex_groups.get(name) or ob.vertex_groups.new(name=name)
+        vg.add([v.index], w, 'REPLACE')
+
+n_orphan = 0
+for v in nail_me.vertices:
+    base = {nail.vertex_groups[g.group].name: g.weight
+            for g in v.groups if g.group not in arm_gidx and g.weight > 1e-6}
+    if not base:
+        best, bd = None, 1e9
+        for h, t, bn in torso_bones:
+            d = seg_dist(v.co, h, t)
+            if d < bd:
+                bd, best = d, bn
+        base = {best: 1.0}
+        n_orphan += 1
+    ssum = sum(base.values())
+    set_weights(nail, v, [(k, w / ssum) for k, w in base.items()])
+nail_me.update()
+log("TORSO_WEIGHTS", "verts", len(nail_me.vertices), "orphans", n_orphan)
+
+# ---- 4.5e eyes + mouth ride rigidly on the head, then weld into the body ----
 head_bone = [b for b in arm.data.bones if b.name.strip().lower() == 'head'][0]
 hvg = det.vertex_groups.get(head_bone.name) or det.vertex_groups.new(name=head_bone.name)
 hvg.add(list(range(len(det.data.vertices))), 1.0, 'REPLACE')
 log("DETAIL_HEAD", head_bone.name, "verts", len(det.data.vertices))
 
-# ---- rejoin ----
 bpy.ops.object.select_all(action='DESELECT')
 nail.select_set(True)
 det.select_set(True)
@@ -215,62 +424,125 @@ nail_me = nail.data
 nail_me.update()
 from collections import Counter
 log("JOINED", "verts", len(nail_me.vertices), "polys", len(nail_me.polygons),
-    "mats", [m.name for m in nail_me.materials],
+    "mats", [m.name if m else None for m in nail_me.materials],
     "mat_faces", dict(Counter(p.material_index for p in nail_me.polygons)))
-log("COLOR_ATTRS_AFTER_REMESH", [(a.name, a.domain, a.data_type) for a in nail_me.color_attributes])
-log("UV_AFTER_REMESH", [u.name for u in nail_me.uv_layers])
 
-# ============================================================
-# 4.5 push arm shell outward so it reads as a separate limb
-#     (fat torso swallows the arms: inner arm sits 1-6 cm inside
-#      the torso silhouette at every height band)
-# ============================================================
-ARM_KEY = ('upperarm', 'forearm', 'hand', 'finger')
-arm_gidx = set(g.index for g in nail.vertex_groups
-               if any(k in g.name.strip().lower() for k in ARM_KEY))
+# ---- 4.5f slim arm meshes along the chain ----
+ARM_R = (0.120, 0.095, 0.080, 0.066)      # shoulder, elbow, wrist, fingertip
 
-def arm_share(v):
-    return sum(g.weight for g in v.groups if g.group in arm_gidx)
+def arm_blend(co, side):
+    ss = sorted((seg_dist(co, h, t), bn) for h, t, bn, s, i in SEGS if s == side)
+    w = sorted(((bn, 1.0 / ((d + 0.02) ** 3)) for d, bn in ss),
+               key=lambda kv: kv[1], reverse=True)[:2]
+    tot = sum(x[1] for x in w) or 1.0
+    return [(bn, x / tot) for bn, x in w]
 
-BASE_PUSH = 0.075      # unused fallback: rigid outward travel in world units
-SH_TAPER = 0.16        # unused fallback
-W0, W1 = 0.10, 0.65    # arm-weight ramp
+def build_arm(side):
+    pt = CHAIN[side]
+    parts = []
+    # push the shoulder root into the torso, else the limb reads as a floating tube
+    root = pt[0] + Vector((0.0, 0.0, -math.copysign(0.095, pt[0].z)))
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=16, radius=0.126,
+                                         location=root)
+    parts.append(bpy.context.object)
+    for i in range(3):
+        h, t = pt[i], pt[i + 1]
+        dv = t - h
+        bpy.ops.mesh.primitive_cone_add(vertices=24, radius1=ARM_R[i], radius2=ARM_R[i + 1],
+                                        depth=dv.length, location=(h + t) * 0.5)
+        c = bpy.context.object
+        c.rotation_mode = 'QUATERNION'
+        c.rotation_quaternion = dv.to_track_quat('Z', 'Y')
+        parts.append(c)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=20, ring_count=12, radius=0.078,
+                                         location=pt[3])
+    parts.append(bpy.context.object)
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in parts:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = parts[0]
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    bpy.ops.object.join()
+    ob = bpy.context.object
+    ob.name = "arm_" + side
 
-# arms are one continuous shell with the fat torso, so translating vertices
-# shears the shoulder apart. instead swing the whole arm out around the
-# shoulder joint: the pivot does not move, the gap opens as a wedge.
-ARM_OUT_DEG = 16.0
+    # The belly is wider than the bone chain, so a limb built straight along it
+    # sinks into the torso from mid-forearm down (measured: up to 0.26 inside).
+    # Bow only the part below the shoulder outwards — the root ball has to stay
+    # buried, otherwise it pops out above the shoulder as a second lobe — so the
+    # hanging arm keeps a visible crease instead of melting into the belly.
+    seg_len = [(pt[i + 1] - pt[i]).length for i in range(3)]
+    total = sum(seg_len)
+    knots = [0.0]
+    for l in seg_len:
+        knots.append(knots[-1] + l / total)
+    BOW, T0, T1 = 0.19, 0.12, 0.70
+    sgn = 1.0 if pt[0].z > 0 else -1.0
 
-sh_pivot = {}
-for b in arm.data.bones:
-    nm = b.name.strip().lower()
-    if 'upperarm' in nm:
-        side = 'L' if nm.startswith('l') else 'R'
-        sh_pivot[side] = arm.matrix_world @ b.head_local
-log("ARM_PIVOT", {k: [round(c, 3) for c in v] for k, v in sh_pivot.items()})
+    def bow_at(t):
+        if t <= T0:
+            return 0.0
+        if t >= T1:
+            return BOW
+        f = (t - T0) / (T1 - T0)
+        return BOW * (f * f * (3.0 - 2.0 * f))
 
-def pivot_for(z):
-    if len(sh_pivot) == 1:
-        return next(iter(sh_pivot.values()))
-    return sh_pivot['L'] if (sh_pivot['L'].z >= 0.0) == (z >= 0.0) else sh_pivot['R']
+    for v in ob.data.vertices:
+        best, bu, bi = 1e9, 0.0, 0
+        for i in range(3):
+            h, t2 = pt[i], pt[i + 1]
+            ab = t2 - h
+            u = max(0.0, min(1.0, (v.co - h).dot(ab) / ab.length_squared))
+            d = (v.co - (h + ab * u)).length
+            if d < best:
+                best, bu, bi = d, u, i
+        v.co.z += sgn * bow_at((knots[bi] * total + bu * seg_len[bi]) / total)
+    ob.data.update()
 
-arm_vs = [v for v in nail_me.vertices if arm_share(v) > 0.02]
-moved, maxd = 0, 0.0
-for v in arm_vs:
-    w = min(1.0, arm_share(v))
-    p = pivot_for(v.co.z)
-    sign = 1.0 if p.z >= 0.0 else -1.0
-    q = Matrix.Rotation(math.radians(sign * ARM_OUT_DEG * w), 4, 'Y')
-    nco = p + (q @ (v.co - p))
-    d = (nco - v.co).length
-    if d <= 1e-5:
-        continue
-    v.co = nco
-    moved += 1
-    maxd = max(maxd, d)
+    rm = ob.modifiers.new("arm_rm", 'REMESH')
+    rm.mode = 'VOXEL'
+    rm.voxel_size = 0.006
+    rm.use_smooth_shade = True
+    bpy.ops.object.modifier_apply(modifier=rm.name)
+    t0 = sum(len(p.vertices) - 2 for p in ob.data.polygons)
+    dc = ob.modifiers.new("arm_dec", 'DECIMATE')
+    dc.decimate_type = 'COLLAPSE'
+    dc.ratio = min(1.0, 2200 / max(1, t0))
+    dc.use_collapse_triangulate = True
+    bpy.ops.object.modifier_apply(modifier=dc.name)
+
+    # a 900-tri budget collapsed the limb into a faceted plank with a hard
+    # corner at the shoulder; at 2200 the silhouette stays round, and one gentle
+    # relax pass removes the remaining voxel staircase
+    bpy.ops.object.select_all(action='DESELECT')
+    ob.select_set(True)
+    bpy.context.view_layer.objects.active = ob
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.vertices_smooth(factor=0.35, repeat=1)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    ob.data.update()
+
+    for v in ob.data.vertices:
+        for bn, w in arm_blend(v.co, side):
+            vg = ob.vertex_groups.get(bn) or ob.vertex_groups.new(name=bn)
+            vg.add([v.index], w, 'REPLACE')
+    ob.data.update()
+    log("ARM_BUILT", ob.name, "verts", len(ob.data.vertices),
+        "polys", len(ob.data.polygons), "groups", [g.name for g in ob.vertex_groups])
+    return ob
+
+arm_objs = [build_arm('L'), build_arm('R')]
+
+bpy.ops.object.select_all(action='DESELECT')
+nail.select_set(True)
+for ob in arm_objs:
+    ob.select_set(True)
+bpy.context.view_layer.objects.active = nail
+bpy.ops.object.join()
+nail_me = nail.data
 nail_me.update()
-log("ARM_PUSH", "arm_verts", len(arm_vs), "moved", moved, "max", round(maxd, 4),
-    "deg", ARM_OUT_DEG)
+log("ARMS_REJOINED", "verts", len(nail_me.vertices), "polys", len(nail_me.polygons))
 
 # ============================================================
 # 5. fresh UV + smooth shading
