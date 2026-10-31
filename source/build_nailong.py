@@ -221,6 +221,58 @@ log("COLOR_ATTRS_AFTER_REMESH", [(a.name, a.domain, a.data_type) for a in nail_m
 log("UV_AFTER_REMESH", [u.name for u in nail_me.uv_layers])
 
 # ============================================================
+# 4.5 push arm shell outward so it reads as a separate limb
+#     (fat torso swallows the arms: inner arm sits 1-6 cm inside
+#      the torso silhouette at every height band)
+# ============================================================
+ARM_KEY = ('upperarm', 'forearm', 'hand', 'finger')
+arm_gidx = set(g.index for g in nail.vertex_groups
+               if any(k in g.name.strip().lower() for k in ARM_KEY))
+
+def arm_share(v):
+    return sum(g.weight for g in v.groups if g.group in arm_gidx)
+
+BASE_PUSH = 0.075      # unused fallback: rigid outward travel in world units
+SH_TAPER = 0.16        # unused fallback
+W0, W1 = 0.10, 0.65    # arm-weight ramp
+
+# arms are one continuous shell with the fat torso, so translating vertices
+# shears the shoulder apart. instead swing the whole arm out around the
+# shoulder joint: the pivot does not move, the gap opens as a wedge.
+ARM_OUT_DEG = 16.0
+
+sh_pivot = {}
+for b in arm.data.bones:
+    nm = b.name.strip().lower()
+    if 'upperarm' in nm:
+        side = 'L' if nm.startswith('l') else 'R'
+        sh_pivot[side] = arm.matrix_world @ b.head_local
+log("ARM_PIVOT", {k: [round(c, 3) for c in v] for k, v in sh_pivot.items()})
+
+def pivot_for(z):
+    if len(sh_pivot) == 1:
+        return next(iter(sh_pivot.values()))
+    return sh_pivot['L'] if (sh_pivot['L'].z >= 0.0) == (z >= 0.0) else sh_pivot['R']
+
+arm_vs = [v for v in nail_me.vertices if arm_share(v) > 0.02]
+moved, maxd = 0, 0.0
+for v in arm_vs:
+    w = min(1.0, arm_share(v))
+    p = pivot_for(v.co.z)
+    sign = 1.0 if p.z >= 0.0 else -1.0
+    q = Matrix.Rotation(math.radians(sign * ARM_OUT_DEG * w), 4, 'Y')
+    nco = p + (q @ (v.co - p))
+    d = (nco - v.co).length
+    if d <= 1e-5:
+        continue
+    v.co = nco
+    moved += 1
+    maxd = max(maxd, d)
+nail_me.update()
+log("ARM_PUSH", "arm_verts", len(arm_vs), "moved", moved, "max", round(maxd, 4),
+    "deg", ARM_OUT_DEG)
+
+# ============================================================
 # 5. fresh UV + smooth shading
 # ============================================================
 bpy.ops.object.mode_set(mode='EDIT')
